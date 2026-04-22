@@ -1,0 +1,16 @@
+# 敏感配置文件
+.env
+.env.*
+
+# Python 缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# 临时文件
+*.log
+*.tmp
