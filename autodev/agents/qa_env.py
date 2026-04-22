@@ -12,8 +12,7 @@ QA_ROOT = PROJECT_ROOT / ".autodev"
 QA_VENV = QA_ROOT / "qa_venv"
 QA_MARKER = QA_ROOT / ".deps_installed"
 PIP_CACHE = QA_ROOT / "pip_cache"
-# 修改为（增加 pydantic[email] 即可自动带上 email-validator）:
-QA_DEPS = ["fastapi", "uvicorn", "sqlalchemy", "pydantic[email]"]
+QA_DEPS = ["fastapi", "uvicorn", "sqlalchemy", "pydantic[email]", "pytest", "httpx"]
 
 
 def _qa_python_path() -> Path:
@@ -32,7 +31,14 @@ def ensure_qa_venv() -> str:
         console.print("[bold red][QA][/bold red] 初始化 QA 缓存 venv...")
         subprocess.run([sys.executable, "-m", "venv", str(QA_VENV)], check=True)
 
-    if not QA_MARKER.exists():
+    marker_ok = False
+    if QA_MARKER.exists():
+        try:
+            marker_ok = QA_MARKER.read_text(encoding="utf-8").strip() == "\n".join(QA_DEPS).strip()
+        except Exception:
+            marker_ok = False
+
+    if not marker_ok:
         console.print("[bold red][QA][/bold red] 首次安装 QA 依赖（只会发生一次）...")
         env = os.environ.copy()
         env["PIP_CACHE_DIR"] = str(PIP_CACHE)

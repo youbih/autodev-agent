@@ -1,0 +1,820 @@
+diff --git a/autodev/agents/architect.py b/autodev/agents/architect.py
+index baf9307..e0d5c9b 100644
+--- a/autodev/agents/architect.py
++++ b/autodev/agents/architect.py
+@@ -1,10 +1,11 @@
+ import json
+ 
+ from rich.console import Console
+-from langchain_core.messages import SystemMessage, HumanMessage
+ 
+ from autodev.workflow.llm import get_llm
+ from autodev.workflow.state import ProjectState
++from autodev.agents.structured_output import invoke_json
++from autodev.agents.failure_control import record_failure
+ 
+ console = Console()
+ 
+@@ -21,54 +22,51 @@ def architect_node(state: ProjectState) -> ProjectState:
+     llm = get_llm()
+     system_prompt = """你是一个资深的 Python 后端架构师。
+ 你的任务是根据用户的项目需求 (Spec)，设计出合理的数据库模型 (SQLAlchemy) 和 API 数据结构 (Pydantic)。
+-请以纯文本的 Markdown 格式输出设计思路，并在其中包含且仅包含两段 Python 代码块：
+-1. 第一段代码块必须是 `models.py` (SQLAlchemy 结构)
+-2. 第二段代码块必须是 `schemas.py` (Pydantic 结构)"""
++你必须只输出一个严格 JSON 对象，不能输出 Markdown、不能输出代码块标记、不能输出任何额外文本。
++
++JSON 格式必须为：
++{
++  "design": "你的设计说明（可用 Markdown 字符串）",
++  "files": {
++    "app/models.py": "完整源码",
++    "app/schemas.py": "完整源码",
++    "app/database.py": "完整源码（如需要，SQLite + SQLAlchemy SessionLocal）"
++  },
++  "summary": "一句话摘要"
++}"""
+ 
+     spec_str = json.dumps(state["spec"], ensure_ascii=False, indent=2)
+     user_prompt = f"这是项目的需求配置 (Spec):\n{spec_str}"
+ 
+-    if state.get("human_feedback"):
+-        console.print(f"[bold yellow][Architect][/bold yellow] 收到老板的修改意见：'{state['human_feedback']}'，正在重做架构设计...")
++    run = state.setdefault("run", {})
++    artifacts = state.setdefault("artifacts", {})
++
++    human_feedback = run.get("human_feedback")
++    if human_feedback:
++        console.print(f"[bold yellow][Architect][/bold yellow] 收到老板的修改意见：'{human_feedback}'，正在重做架构设计...")
+         user_prompt += (
+-            f"\n\n【重要】用户对你上次的设计提出了修改意见：\n{state['human_feedback']}\n"
++            f"\n\n【重要】用户对你上次的设计提出了修改意见：\n{human_feedback}\n"
+             "请你反思上次的设计，并严格根据意见重新输出设计思路和完整的代码块！"
+         )
+-        state["human_feedback"] = ""
+-
+-    messages = [
+-        SystemMessage(content=system_prompt),
+-        HumanMessage(content=user_prompt),
+-    ]
+-
+-    response = llm.invoke(messages)
+-
+-    code_blocks = []
+-    lines = response.content.split("\n")
+-    in_block = False
+-    current_block = []
+-    for line in lines:
+-        if line.strip().startswith("```python"):
+-            in_block = True
+-            current_block = []
+-        elif line.strip().startswith("```") and in_block:
+-            in_block = False
+-            code_blocks.append("\n".join(current_block))
+-        elif in_block:
+-            current_block.append(line)
+-
+-    if len(code_blocks) >= 2:
+-        state["files"]["app/models.py"] = code_blocks[0]
+-        state["files"]["app/schemas.py"] = code_blocks[1]
++        run["human_feedback"] = ""
++
++    parsed, raw_text = invoke_json(llm, system_prompt=system_prompt, user_prompt=user_prompt, max_attempts=3)
++    files = parsed.get("files") if isinstance(parsed, dict) else None
++    if isinstance(files, dict):
++        for p, c in files.items():
++            if isinstance(p, str) and isinstance(c, str):
++                artifacts[p] = c
+         console.print("[bold blue][Architect][/bold blue] ✅ 数据库模型和数据结构设计完成！")
+     else:
+-        state["files"]["app/models.py"] = "# 需重试"
+-        state["files"]["app/schemas.py"] = "# 需重试"
++        artifacts["app/models.py"] = "# 需重试"
++        artifacts["app/schemas.py"] = "# 需重试"
++        record_failure(state, step="architect", reason="invalid_json_or_missing_files", detail=raw_text)
+ 
+-    state["architect_design"] = response.content
++    state["architect_design"] = str(parsed.get("design") or raw_text or "")
++    run.setdefault("agent_summaries", {})["architect"] = str(parsed.get("summary") or "")
+ 
+-    if "app/database.py" not in state["files"]:
+-        state["files"]["app/database.py"] = """from sqlalchemy import create_engine
++    if "app/database.py" not in artifacts:
++        artifacts["app/database.py"] = """from sqlalchemy import create_engine
+ from sqlalchemy.orm import sessionmaker
+ 
+ DATABASE_URL = "sqlite:///./app.db"
+@@ -79,4 +77,4 @@ engine = create_engine(
+ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+ """
+ 
+-    return state
+\ No newline at end of file
++    return state
+diff --git a/autodev/agents/coder.py b/autodev/agents/coder.py
+index 8db2304..3f9130f 100644
+--- a/autodev/agents/coder.py
++++ b/autodev/agents/coder.py
+@@ -1,10 +1,11 @@
+ import json
+ 
+ from rich.console import Console
+-from langchain_core.messages import SystemMessage, HumanMessage
+ 
+ from autodev.workflow.llm import get_llm
+ from autodev.workflow.state import ProjectState
++from autodev.agents.structured_output import invoke_json
++from autodev.agents.failure_control import record_failure
+ 
+ console = Console()
+ 
+@@ -13,7 +14,10 @@ def coder_node(state: ProjectState) -> ProjectState:
+     console.print(f"[bold green][Coder][/bold green] 正在为项目 '{state['project_name']}' 编写业务代码...")
+ 
+     llm = get_llm()
+-    is_fixing = "errors" in state and len(state["errors"]) > 0
++    run = state.setdefault("run", {})
++    artifacts = state.setdefault("artifacts", {})
++    errors = run.get("errors") or []
++    is_fixing = len(errors) > 0
+ 
+     architecture_type = str(state["spec"].get("architecture", "")).lower()
+ 
+@@ -28,12 +32,16 @@ def coder_node(state: ProjectState) -> ProjectState:
+ - 提供清晰的中文提示与必要的异常处理（输入校验等）
+ 
+ 输出要求：
+-- 请仅输出一段包含 `main.py` 完整代码的 Markdown Python 代码块。"""
++- 你必须只输出一个严格 JSON 对象，不能输出 Markdown、不能输出代码块标记、不能输出任何额外文本。
++- JSON 格式必须为：{"files": {"app/main.py": "完整源码"}, "summary": "一句话摘要"}"""
+     else:
+         system_prompt = """你是一个高级 Python 后端工程师，擅长写 FastAPI 框架。
+ 架构师已经为你设计好了 `models.py` (SQLAlchemy) 和 `schemas.py` (Pydantic)。
+ 你的任务是编写 FastAPI 的入口文件 `main.py`，实现用户需求中的所有接口。
+ 
++【运行约定（必须遵守）】
++- main.py 必须暴露 FastAPI 实例变量名：app（即 app = FastAPI()）
++
+ 【导入规范（必须遵守）】
+ - 项目内模块必须使用包导入：from app.xxx import ... 或 from app import xxx
+ - 严禁使用裸导入：import models / import schemas / import database
+ - 除标准库/第三方库外，main.py 中所有本地模块导入必须以 app. 开头（例如 from app.models import User）
+@@ -45,7 +53,8 @@ def coder_node(state: ProjectState) -> ProjectState:
+ - 禁止使用 app.core.database 或其他路径（比如 from app.core.database ... / from database ... 都不允许）
+ 
+ 输出要求：
+-- 请仅输出一段包含 `main.py` 完整代码的 Markdown Python 代码块。"""
++- 你必须只输出一个严格 JSON 对象，不能输出 Markdown、不能输出代码块标记、不能输出任何额外文本。
++- JSON 格式必须为：{"files": {"app/main.py": "完整源码"}, "summary": "一句话摘要"}"""
+ 
+     spec_str = json.dumps(state["spec"], ensure_ascii=False, indent=2)
+     user_prompt = (
+@@ -55,39 +64,29 @@ def coder_node(state: ProjectState) -> ProjectState:
+     )
+ 
+     if is_fixing:
+-        error_msg = state["errors"][-1]
++        error_msg = errors[-1]
+         console.print("[bold yellow][Coder][/bold yellow] 收到报错反馈，正在尝试修复...")
+         user_prompt += (
+             f"\n\n【警告】你之前写的代码报错了：\n{error_msg}\n"
+             "请你仔细分析并提供修复后的完整 `main.py` 代码。"
+         )
+-        state["errors"] = []
+-        state["files"]["fixed"] = "true"
+-
+-    messages = [
+-        SystemMessage(content=system_prompt),
+-        HumanMessage(content=user_prompt),
+-    ]
+-
+-    response = llm.invoke(messages)
+-
+-    lines = response.content.split("\n")
+-    in_block = False
+-    current_block = []
+-    for line in lines:
+-        if line.strip().startswith("```python"):
+-            in_block = True
+-            current_block = []
+-        elif line.strip().startswith("```") and in_block:
+-            in_block = False
+-            state["files"]["app/main.py"] = "\n".join(current_block)
+-            break
+-        elif in_block:
+-            current_block.append(line)
+-
+-    if "app/main.py" not in state["files"]:
++        run["errors"] = []
++        run.setdefault("flags", {})["fixed"] = True
++
++    parsed, raw_text = invoke_json(llm, system_prompt=system_prompt, user_prompt=user_prompt, max_attempts=3)
++    files = parsed.get("files") if isinstance(parsed, dict) else None
++    if isinstance(files, dict):
++        for p, c in files.items():
++            if isinstance(p, str) and isinstance(c, str):
++                artifacts[p] = c
++    run.setdefault("agent_summaries", {})["coder"] = str(parsed.get("summary") or "")
++
++    if "app/main.py" not in artifacts:
+         console.print("[bold red][Coder] ❌ 代码提取失败！[/bold red]")
++        run.setdefault("errors", [])
++        run["errors"].append(f"Coder JSON 输出解析失败:\n```text\n{raw_text}\n```")
++        record_failure(state, step="coder", reason="invalid_json_or_missing_main", detail=raw_text)
+     else:
+         console.print("[bold green][Coder][/bold green] ✅ main.py 业务代码编写完成！")
+ 
+-    return state
+\ No newline at end of file
++    return state
+diff --git a/autodev/agents/failure_control.py b/autodev/agents/failure_control.py
+new file mode 100644
+index 0000000..8594f02
+--- /dev/null
++++ b/autodev/agents/failure_control.py
+@@ -0,0 +1,38 @@
++from __future__ import annotations
++
++from typing import Any, Dict, List, Tuple
++
++
++def init_run_controls(state: Dict[str, Any]) -> Dict[str, Any]:
++    run = state.setdefault("run", {})
++    run.setdefault("retry_count", 0)
++    run.setdefault("max_retries", 3)
++    run.setdefault("failures", [])
++    run.setdefault("errors", [])
++    run.setdefault("flags", {})
++    run.setdefault("qa", {"passed": False})
++    return state
++
++
++def record_failure(
++    state: Dict[str, Any],
++    *,
++    step: str,
++    reason: str,
++    detail: str | None = None,
++) -> None:
++    run = state.setdefault("run", {})
++    failures: List[Dict[str, Any]] = run.setdefault("failures", [])
++    failures.append(
++        {
++            "step": step,
++            "reason": reason,
++            "detail": detail or "",
++        }
++    )
++
++
++def bump_retry(state: Dict[str, Any]) -> Tuple[int, int]:
++    run = state.setdefault("run", {})
++    run["retry_count"] = int(run.get("retry_count", 0)) + 1
++    return int(run["retry_count"]), int(run.get("max_retries", 3))
+diff --git a/autodev/agents/human.py b/autodev/agents/human.py
+index 2112297..e9ab4c7 100644
+--- a/autodev/agents/human.py
++++ b/autodev/agents/human.py
+@@ -10,6 +10,11 @@ def human_review_node(state: ProjectState) -> ProjectState:
+     if "单文件脚本" in architecture_type or "script" in architecture_type:
+         return state
+ 
++    run = state.setdefault("run", {})
++    if not run.get("human_review_enabled", True):
++        run["human_feedback"] = ""
++        return state
++
+     console.print("\n[bold cyan]================ 👨‍💻 人工审查环节 =================[/bold cyan]")
+     console.print(f"[dim]{state.get('architect_design', '无设计稿')}[/dim]")
+     console.print("[bold cyan]==================================================[/bold cyan]")
+@@ -17,14 +22,15 @@ def human_review_node(state: ProjectState) -> ProjectState:
+     feedback = console.input("[bold yellow]架构设计是否通过？(输入 'y' 或直接回车同意，输入具体的修改意见让架构师重做): [/bold yellow]")
+ 
+     if feedback.strip().lower() in ["y", "yes", "ok", ""]:
+-        state["human_feedback"] = ""
++        run["human_feedback"] = ""
+     else:
+-        state["human_feedback"] = feedback
++        run["human_feedback"] = feedback
+ 
+     return state
+ 
+ 
+ def route_after_review(state: ProjectState) -> str:
+-    if state.get("human_feedback"):
++    run = state.get("run") or {}
++    if run.get("human_feedback"):
+         return "architect"
+-    return "coder"
+\ No newline at end of file
++    return "coder"
+diff --git a/autodev/agents/qa.py b/autodev/agents/qa.py
+index e0b19ef..2aafa51 100644
+--- a/autodev/agents/qa.py
++++ b/autodev/agents/qa.py
+@@ -1,26 +1,82 @@
+ import subprocess
+ import tempfile
+ from pathlib import Path
++from typing import List
+ 
+ from rich.console import Console
+ 
+ from autodev.agents.qa_env import ensure_qa_venv
++from autodev.agents.failure_control import record_failure
+ from autodev.workflow.state import ProjectState
+ 
+ console = Console()
+ 
+ 
++def _extract_smoke_paths(endpoints: object) -> List[str]:
++    if not isinstance(endpoints, list):
++        return []
++
++    paths: List[str] = []
++    for item in endpoints:
++        if not isinstance(item, str):
++            continue
++        s = item.strip()
++        if not s:
++            continue
++        path = s.split()[0].strip()
++        if not path.startswith("/"):
++            continue
++        path = path.replace("{id}", "1").replace("{user_id}", "1")
++        paths.append(path)
++
++    seen = set()
++    out: List[str] = []
++    for p in paths:
++        if p not in seen:
++            seen.add(p)
++            out.append(p)
++    return out
++
++
++def _write_fastapi_smoke_test(temp_path: Path, spec: object) -> None:
++    endpoints = []
++    if isinstance(spec, dict):
++        endpoints = _extract_smoke_paths(spec.get("endpoints"))
++
++    lines: List[str] = []
++    lines.append("from fastapi.testclient import TestClient")
++    lines.append("")
++    lines.append("from app.main import app")
++    lines.append("")
++    lines.append("client = TestClient(app)")
++    lines.append("")
++    lines.append("def test_openapi_smoke():")
++    lines.append("    resp = client.get('/openapi.json')")
++    lines.append("    assert resp.status_code == 200")
++
++    if endpoints:
++        lines.append("")
++        lines.append("def test_endpoints_smoke():")
++        for p in endpoints:
++            lines.append(f"    resp = client.get('{p}')")
++            lines.append("    assert resp.status_code < 500")
++
++    test_path = temp_path / "tests" / "test_smoke.py"
++    test_path.parent.mkdir(parents=True, exist_ok=True)
++    test_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++
++
+ def qa_node(state: ProjectState) -> ProjectState:
+     console.print("[bold red][QA][/bold red] 使用缓存 venv 执行隔离验证...")
+ 
+     qa_python = ensure_qa_venv()
++    run = state.setdefault("run", {})
++    artifacts = state.setdefault("artifacts", {})
+ 
+     with tempfile.TemporaryDirectory() as temp_dir:
+         temp_path = Path(temp_dir)
+ 
+-        for file_path, content in state["files"].items():
+-            if file_path == "fixed":
+-                continue
++        for file_path, content in artifacts.items():
+             full_path = temp_path / file_path
+             full_path.parent.mkdir(parents=True, exist_ok=True)
+             full_path.write_text(content, encoding="utf-8")
+@@ -29,20 +85,55 @@ def qa_node(state: ProjectState) -> ProjectState:
+ 
+         if "单文件脚本" in architecture_type or "script" in architecture_type:
+             check_cmd = [qa_python, "-m", "py_compile", "app/main.py"]
++            console.print(f"[bold red][QA][/bold red] 执行: {' '.join(check_cmd)}")
++            result = subprocess.run(
++                check_cmd,
++                cwd=str(temp_path),
++                capture_output=True,
++                text=True,
++            )
++            if result.returncode != 0:
++                error_log = (result.stderr or result.stdout or "").strip()
++                if len(error_log) > 800:
++                    error_log = "..." + error_log[-800:]
++                console.print("[bold red][QA] ❌ 语法检查失败[/bold red]")
++                console.print(f"[dim]{error_log}[/dim]")
++                run.setdefault("errors", [])
++                run["errors"] = [f"QA 语法检查失败:\n```text\n{error_log}\n```"]
++                run["qa"] = {"passed": False, "error": error_log, "command": check_cmd}
++                record_failure(state, step="qa", reason="py_compile_failed", detail=error_log)
++                return state
++
++            smoke_cmd = [qa_python, "app/main.py"]
++            check_cmd = smoke_cmd
++            console.print(f"[bold red][QA][/bold red] 执行: {' '.join(smoke_cmd)}")
++            try:
++                result = subprocess.run(
++                    smoke_cmd,
++                    cwd=str(temp_path),
++                    input="q\n",
++                    capture_output=True,
++                    text=True,
++                    timeout=8,
++                )
++            except subprocess.TimeoutExpired:
++                error_log = "CLI smoke test timeout"
++                console.print("[bold red][QA] ❌ CLI smoke test 超时[/bold red]")
++                run.setdefault("errors", [])
++                run["errors"] = [f"QA smoke test 失败:\n```text\n{error_log}\n```"]
++                run["qa"] = {"passed": False, "error": error_log, "command": smoke_cmd}
++                record_failure(state, step="qa", reason="cli_smoke_timeout", detail=error_log)
++                return state
+         else:
+-            check_cmd = [
+-                qa_python,
+-                "-c",
+-                "import sys; sys.path.insert(0, '.'); import app.main",
+-            ]
+-
+-        console.print(f"[bold red][QA][/bold red] 执行: {' '.join(check_cmd)}")
+-        result = subprocess.run(
+-            check_cmd,
+-            cwd=str(temp_path),
+-            capture_output=True,
+-            text=True,
+-        )
++            _write_fastapi_smoke_test(temp_path, state.get("spec"))
++            check_cmd = [qa_python, "-m", "pytest", "-q"]
++            console.print(f"[bold red][QA][/bold red] 执行: {' '.join(check_cmd)}")
++            result = subprocess.run(
++                check_cmd,
++                cwd=str(temp_path),
++                capture_output=True,
++                text=True,
++            )
+ 
+         if result.returncode != 0:
+             error_log = (result.stderr or result.stdout or "").strip()
+@@ -50,10 +141,12 @@ def qa_node(state: ProjectState) -> ProjectState:
+                 error_log = "..." + error_log[-800:]
+             console.print("[bold red][QA] ❌ 沙盒验证失败[/bold red]")
+             console.print(f"[dim]{error_log}[/dim]")
+-            state["errors"] = [f"QA 验证失败:\n```text\n{error_log}\n```"]
+-            state["test_passed"] = False
++            run.setdefault("errors", [])
++            run["errors"] = [f"QA 验证失败:\n```text\n{error_log}\n```"]
++            run["qa"] = {"passed": False, "error": error_log, "command": check_cmd}
++            record_failure(state, step="qa", reason="sandbox_validation_failed", detail=error_log)
+             return state
+ 
+     console.print("[bold green][QA] ✅ 沙盒验证通过[/bold green]")
+-    state["test_passed"] = True
+-    return state
+\ No newline at end of file
++    run["qa"] = {"passed": True, "command": check_cmd}
++    return state
+diff --git a/autodev/agents/qa_env.py b/autodev/agents/qa_env.py
+index 8f55822..e0ba883 100644
+--- a/autodev/agents/qa_env.py
++++ b/autodev/agents/qa_env.py
+@@ -12,8 +12,7 @@ QA_ROOT = PROJECT_ROOT / ".autodev"
+ QA_VENV = QA_ROOT / "qa_venv"
+ QA_MARKER = QA_ROOT / ".deps_installed"
+ PIP_CACHE = QA_ROOT / "pip_cache"
+-# 修改为（增加 pydantic[email] 即可自动带上 email-validator）:
+-QA_DEPS = ["fastapi", "uvicorn", "sqlalchemy", "pydantic[email]"]
++QA_DEPS = ["fastapi", "uvicorn", "sqlalchemy", "pydantic[email]", "pytest", "httpx"]
+ 
+@@ -32,7 +31,14 @@ def ensure_qa_venv() -> str:
+         console.print("[bold red][QA][/bold red] 初始化 QA 缓存 venv...")
+         subprocess.run([sys.executable, "-m", "venv", str(QA_VENV)], check=True)
+ 
+-    if not QA_MARKER.exists():
++    marker_ok = False
++    if QA_MARKER.exists():
++        try:
++            marker_ok = QA_MARKER.read_text(encoding="utf-8").strip() == "\n".join(QA_DEPS).strip()
++        except Exception:
++            marker_ok = False
++
++    if not marker_ok:
+         console.print("[bold red][QA][/bold red] 首次安装 QA 依赖（只会发生一次）...")
+         env = os.environ.copy()
+         env["PIP_CACHE_DIR"] = str(PIP_CACHE)
+@@ -42,4 +48,4 @@ def ensure_qa_venv() -> str:
+ 
+         QA_MARKER.write_text("\n".join(QA_DEPS), encoding="utf-8")
+ 
+-    return str(py)
+\ No newline at end of file
++    return str(py)
+diff --git a/autodev/agents/structured_output.py b/autodev/agents/structured_output.py
+new file mode 100644
+index 0000000..7c93ce8
+--- /dev/null
++++ b/autodev/agents/structured_output.py
+@@ -0,0 +1,56 @@
++import json
++from typing import Any, Dict, List, Optional, Tuple
++
++from langchain_core.messages import HumanMessage, SystemMessage
++
++
++def _strip_code_fences(text: str) -> str:
++    s = (text or "").strip()
++    if s.startswith("```"):
++        lines = s.splitlines()
++        if lines and lines[0].startswith("```"):
++            lines = lines[1:]
++        if lines and lines[-1].strip().startswith("```"):
++            lines = lines[:-1]
++        s = "\n".join(lines).strip()
++    return s
++
++
++def invoke_json(
++    llm: Any,
++    *,
++    system_prompt: str,
++    user_prompt: str,
++    max_attempts: int = 3,
++    extra_messages: Optional[List[Any]] = None,
++) -> Tuple[Dict[str, Any], str]:
++    messages: List[Any] = [SystemMessage(content=system_prompt)]
++    if extra_messages:
++        messages.extend(extra_messages)
++    messages.append(HumanMessage(content=user_prompt))
++
++    last_text = ""
++    for i in range(max_attempts):
++        resp = llm.invoke(messages)
++        last_text = getattr(resp, "content", "") or ""
++        candidate = _strip_code_fences(last_text)
++        try:
++            obj = json.loads(candidate)
++            if isinstance(obj, dict):
++                return obj, last_text
++        except Exception as e:
++            err = str(e)
++            messages.append(
++                HumanMessage(
++                    content=(
++                        "你的上一条输出不是合法 JSON。\n"
++                        f"错误信息：{err}\n"
++                        "请你重新输出，只能输出一个 JSON 对象，不要 Markdown，不要代码块，不要任何额外文本。"
++                    )
++                )
++            )
++
++        if i == max_attempts - 1:
++            break
++
++    return {}, last_text
+diff --git a/autodev/agents/tech_writer.py b/autodev/agents/tech_writer.py
+index 137489e..4a5768e 100644
+--- a/autodev/agents/tech_writer.py
++++ b/autodev/agents/tech_writer.py
+@@ -1,10 +1,11 @@
+ import json
+ 
+ from rich.console import Console
+-from langchain_core.messages import SystemMessage, HumanMessage
+ 
+ from autodev.workflow.llm import get_llm
+ from autodev.workflow.state import ProjectState
++from autodev.agents.structured_output import invoke_json
++from autodev.agents.failure_control import record_failure
+ 
+ console = Console()
+ 
+@@ -13,11 +14,11 @@ def tech_writer_node(state: ProjectState) -> ProjectState:
+     console.print("[bold magenta][TechWriter][/bold magenta] 正在阅读生成的代码，推导架构并生成专业的 README.md...")
+ 
+     llm = get_llm()
++    run = state.setdefault("run", {})
++    artifacts = state.setdefault("artifacts", {})
+ 
+     code_context = ""
+-    for file_path, content in state["files"].items():
+-        if file_path == "fixed":
+-            continue
++    for file_path, content in artifacts.items():
+         code_context += f"--- {file_path} ---\n```python\n{content}\n```\n\n"
+ 
+     system_prompt = """你是一个高级技术文档工程师 (Technical Writer)。
+@@ -31,20 +32,31 @@ def tech_writer_node(state: ProjectState) -> ProjectState:
+ 4. 快速启动命令
+ 5. 接口说明与 curl 示例
+ 
+-只输出完整的 Markdown 文档，不要包含任何多余的废话。"""
++你必须只输出一个严格 JSON 对象，不能输出 Markdown、不能输出代码块标记、不能输出任何额外文本。
++
++JSON 格式必须为：
++{
++  "files": {"README.md": "完整 Markdown 文档"},
++  "summary": "一句话摘要"
++}"""
+ 
+     spec_str = json.dumps(state["spec"], ensure_ascii=False, indent=2)
+     user_prompt = f"这是项目的需求 (Spec):\n{spec_str}\n\n这是开发团队生成的完整项目代码:\n{code_context}\n\n请你开始撰写 README.md！"
+ 
+-    messages = [
+-        SystemMessage(content=system_prompt),
+-        HumanMessage(content=user_prompt),
+-    ]
+-
+-    response = llm.invoke(messages)
+-
+-    state["readme_content"] = response.content
+-    state["files"]["README.md"] = response.content
++    parsed, raw_text = invoke_json(llm, system_prompt=system_prompt, user_prompt=user_prompt, max_attempts=3)
++    files = parsed.get("files") if isinstance(parsed, dict) else None
++    readme = None
++    if isinstance(files, dict):
++        readme = files.get("README.md")
++    run.setdefault("agent_summaries", {})["tech_writer"] = str(parsed.get("summary") or "")
++
++    if isinstance(readme, str) and readme.strip():
++        run["readme_content"] = readme
++        artifacts["README.md"] = readme
++    else:
++        run["readme_content"] = raw_text
++        artifacts["README.md"] = raw_text
++        record_failure(state, step="tech_writer", reason="invalid_json_or_missing_readme", detail=raw_text)
+ 
+     console.print("[bold magenta][TechWriter][/bold magenta] ✅ 专业文档生成完成！")
+-    return state
+\ No newline at end of file
++    return state
+diff --git a/autodev/cli.py b/autodev/cli.py
+index 19a1c11..7d7d105 100644
+--- a/autodev/cli.py
++++ b/autodev/cli.py
+@@ -1,9 +1,13 @@
++import hashlib
++import json
+ import typer
+ import yaml
+ import os
++from datetime import datetime, timezone
+ from pathlib import Path
+ from rich.console import Console
+ from autodev.workflow.graph import build_graph
++from autodev.agents.failure_control import init_run_controls
+ 
+ app = typer.Typer(help="AutoDev: 企业级后端代码生成与交付 Agent")
+ console = Console()
+@@ -40,7 +44,10 @@ def init(name: str = typer.Option(..., help="项目名称"),
+     console.print("你可以手动修改该文件，然后运行 `autodev build` 开始生成代码。")
+ 
+ @app.command()
+-def build(spec_path: Path = typer.Argument(..., help="Spec 文件的路径")):
++def build(
++    spec_path: Path = typer.Argument(..., help="Spec 文件的路径"),
++    non_interactive: bool = typer.Option(False, "--non-interactive", help="禁用人工审查，适配批量构建/CI"),
++):
+@@ -58,11 +65,17 @@ def build(spec_path: Path = typer.Argument(..., help="Spec 文件的路径")):
+     initial_state = {
+         "project_name": project_name,
+         "spec": spec,
+-        "files": {},
+-        "errors": [],
+-        "test_passed": False,
+-        "readme_content": ""
++        "artifacts": {},
++        "architect_design": "",
++        "run": {
++            "errors": [],
++            "qa": {"passed": False},
++        },
+     }
++    init_run_controls(initial_state)
++    initial_state["run"]["max_retries"] = int(spec.get("max_retries", initial_state["run"].get("max_retries", 3)))
++    initial_state["run"]["non_interactive"] = bool(non_interactive)
++    initial_state["run"]["human_review_enabled"] = (not non_interactive) and bool(spec.get("human_review_enabled", True))
+     
+     graph = build_graph()
+     final_state = graph.invoke(initial_state)
+@@ -70,14 +83,33 @@ def build(spec_path: Path = typer.Argument(..., help="Spec 文件的路径")):
+     
+     project_dir = WORKSPACE_DIR / project_name
+-    for file_path, content in final_state["files"].items():
++    for file_path, content in final_state.get("artifacts", {}).items():
+         full_path = project_dir / file_path
+         full_path.parent.mkdir(parents=True, exist_ok=True)
+         with open(full_path, "w", encoding="utf-8") as f:
+             f.write(content)
++
++    artifacts_index = []
++    for file_path, content in final_state.get("artifacts", {}).items():
++        if not isinstance(content, str):
++            continue
++        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
++        artifacts_index.append({"path": file_path, "sha256": digest, "bytes": len(content.encode("utf-8"))})
++
++    report = {
++        "project_name": project_name,
++        "generated_at": datetime.now(timezone.utc).isoformat(),
++        "spec": spec,
++        "run": final_state.get("run", {}),
++        "artifacts": artifacts_index,
++    }
++
++    report_path = project_dir / "build_report.json"
++    report_path.parent.mkdir(parents=True, exist_ok=True)
++    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+             
+     console.print(f"\n[bold green]🎉 项目 {project_name} 交付完成！[/bold green]")
+     console.print(f"代码已保存至: {project_dir.absolute()}")
+ 
+ if __name__ == "__main__":
+-    app()
+\ No newline at end of file
++    app()
+diff --git a/autodev/workflow/graph.py b/autodev/workflow/graph.py
+index 9d737d2..fe6cb6e 100644
+--- a/autodev/workflow/graph.py
++++ b/autodev/workflow/graph.py
+@@ -6,14 +6,26 @@ from autodev.agents.human import human_review_node, route_after_review
+ from autodev.agents.coder import coder_node
+ from autodev.agents.qa import qa_node
+ from autodev.agents.tech_writer import tech_writer_node
++from autodev.agents.failure_control import bump_retry
+ 
+ 
+ def route_after_qa(state: ProjectState) -> str:
+-    if not state.get("test_passed", False):
++    run = state.get("run") or {}
++    qa = run.get("qa") or {}
++    if not qa.get("passed", False):
++        retry_count, max_retries = bump_retry(state)
++        if retry_count > max_retries:
++            run["failed"] = True
++            run["failure_reason"] = "max_retries_exceeded"
++            return "fail"
+         return "coder"
+     return "tech_writer"
+ 
++
++def fail_node(state: ProjectState) -> ProjectState:
++    return state
++
++
+ def build_graph():
+@@ -22,6 +34,7 @@ def build_graph():
+     workflow.add_node("coder", coder_node)
+     workflow.add_node("qa", qa_node)
+     workflow.add_node("tech_writer", tech_writer_node)
++    workflow.add_node("fail", fail_node)
+@@ -43,9 +56,11 @@ def build_graph():
+         {
+             "coder": "coder",
+             "tech_writer": "tech_writer",
++            "fail": "fail",
+         },
+     )
+ 
+     workflow.add_edge("tech_writer", END)
++    workflow.add_edge("fail", END)
+ 
+-    return workflow.compile()
+\ No newline at end of file
++    return workflow.compile()
+diff --git a/autodev/workflow/state.py b/autodev/workflow/state.py
+index a562311..353d939 100644
+--- a/autodev/workflow/state.py
++++ b/autodev/workflow/state.py
+@@ -1,14 +1,8 @@
+-from typing import TypedDict, Dict, List, Any
++from typing import Any, Dict, TypedDict
+ 
+-class ProjectState(TypedDict):
+-    """
+-    定义贯穿整个生成过程的状态数据
+-    """
++class ProjectState(TypedDict, total=False):
+     project_name: str
+-    spec: Dict[str, Any]          # 用户定义的需求配置
+-    architect_design: str         # 架构师的设计思路 (给 Coder 看的)
+-    human_feedback: str           # 老板(用户)的打回修改意见
+-    files: Dict[str, str]         # 生成的文件集合 {文件路径: 代码内容}
+-    errors: List[str]             # 运行测试时的报错信息 (用于后续自愈)
+-    test_passed: bool             # QA 验证是否通过
+-    readme_content: str           # 最终生成的 README
+\ No newline at end of file
++    spec: Dict[str, Any]
++    artifacts: Dict[str, str]
++    architect_design: str
++    run: Dict[str, Any]

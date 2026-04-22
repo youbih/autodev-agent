@@ -1,20 +1,15 @@
-# main.py
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
+import datetime
 
+from app import models, schemas
 from app.database import SessionLocal, engine
-from app.models import Base, User
-from app.schemas import UserCreate, UserUpdate, UserResponse, UserListResponse
 
 # 创建数据库表
-Base.metadata.create_all(bind=engine)
+models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(
-    title="My User Service",
-    description="基于 FastAPI 的用户服务后端",
-    version="1.0.0"
-)
+app = FastAPI(title="my_user_service", description="基于 FastAPI 的后端服务")
 
 # 依赖项：获取数据库会话
 def get_db():
@@ -24,113 +19,109 @@ def get_db():
     finally:
         db.close()
 
-# 辅助函数：将 User 模型转换为 UserResponse
-def user_to_response(user: User) -> UserResponse:
-    return UserResponse(
-        id=user.id,
+@app.get("/", tags=["Root"])
+async def root():
+    return {"message": "Welcome to my_user_service"}
+
+@app.get("/users", response_model=List[schemas.User], tags=["Users"])
+def read_users(
+    skip: int = Query(0, ge=0, description="跳过的记录数"),
+    limit: int = Query(100, ge=1, le=100, description="返回的最大记录数"),
+    db: Session = Depends(get_db)
+):
+    """获取用户列表（分页支持）"""
+    users = db.query(models.User).offset(skip).limit(limit).all()
+    return users
+
+@app.post("/users", response_model=schemas.User, status_code=status.HTTP_201_CREATED, tags=["Users"])
+def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    """创建新用户"""
+    # 检查用户名是否已存在
+    db_user_by_username = db.query(models.User).filter(models.User.username == user.username).first()
+    if db_user_by_username:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    # 检查邮箱是否已存在
+    db_user_by_email = db.query(models.User).filter(models.User.email == user.email).first()
+    if db_user_by_email:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # 创建用户（这里简化密码处理，实际应该使用哈希）
+    db_user = models.User(
         username=user.username,
         email=user.email,
         full_name=user.full_name,
-        is_active=user.is_active,
-        created_at=user.created_at,
-        updated_at=user.updated_at
+        hashed_password=f"hashed_{user.password}",  # 实际应该使用 bcrypt 等库
+        is_active=True,
+        created_at=datetime.datetime.now(),
+        updated_at=datetime.datetime.now()
     )
-
-# 辅助函数：获取用户或抛出 404 异常
-def get_user_or_404(db: Session, user_id: int) -> User:
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"用户 ID {user_id} 不存在"
-        )
-    return user
-
-@app.get("/users", response_model=UserListResponse, status_code=status.HTTP_200_OK)
-def list_users(db: Session = Depends(get_db)):
-    """获取所有用户列表"""
-    users = db.query(User).all()
-    user_responses = [user_to_response(user) for user in users]
-    return UserListResponse(users=user_responses, total=len(users))
-
-@app.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
-    """创建新用户"""
-    # 检查用户名是否已存在
-    existing_user = db.query(User).filter(
-        (User.username == user_data.username) | (User.email == user_data.email)
-    ).first()
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="用户名或邮箱已被注册"
-        )
-
-    # 创建用户（实际项目中应使用密码哈希，此处简化处理）
-    new_user = User(
-        username=user_data.username,
-        email=user_data.email,
-        password_hash=user_data.password,  # 注意：生产环境应使用哈希
-        full_name=user_data.full_name
-    )
-    db.add(new_user)
+    db.add(db_user)
     db.commit()
-    db.refresh(new_user)
-    return user_to_response(new_user)
+    db.refresh(db_user)
+    return db_user
 
-@app.get("/users/{user_id}", response_model=UserResponse, status_code=status.HTTP_200_OK)
-def get_user(user_id: int, db: Session = Depends(get_db)):
-    """根据 ID 获取用户详情"""
-    user = get_user_or_404(db, user_id)
-    return user_to_response(user)
+@app.get("/users/{user_id}", response_model=schemas.User, tags=["Users"])
+def read_user(user_id: int, db: Session = Depends(get_db)):
+    """获取指定用户"""
+    db_user = db.query(models.User).filter(models.User.id == user_id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return db_user
 
-@app.put("/users/{user_id}", response_model=UserResponse, status_code=status.HTTP_200_OK)
-def update_user(user_id: int, user_data: UserUpdate, db: Session = Depends(get_db)):
-    """更新用户信息（部分更新）"""
-    user = get_user_or_404(db, user_id)
-
-    # 检查用户名/邮箱是否与其他用户冲突
-    if user_data.username is not None:
-        conflict = db.query(User).filter(
-            User.username == user_data.username,
-            User.id != user_id
+@app.put("/users/{user_id}", response_model=schemas.User, tags=["Users"])
+def update_user(user_id: int, user_update: schemas.UserUpdate, db: Session = Depends(get_db)):
+    """更新用户信息"""
+    db_user = db.query(models.User).filter(models.User.id == user_id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # 更新字段（只更新提供的字段）
+    update_data = user_update.dict(exclude_unset=True)
+    
+    # 如果更新了密码，需要哈希处理
+    if "password" in update_data:
+        update_data["hashed_password"] = f"hashed_{update_data.pop('password')}"
+    
+    # 检查用户名唯一性（如果提供了用户名）
+    if "username" in update_data and update_data["username"] != db_user.username:
+        existing_user = db.query(models.User).filter(
+            models.User.username == update_data["username"],
+            models.User.id != user_id
         ).first()
-        if conflict:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="用户名已被其他用户使用"
-            )
-        user.username = user_data.username
-
-    if user_data.email is not None:
-        conflict = db.query(User).filter(
-            User.email == user_data.email,
-            User.id != user_id
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Username already taken")
+    
+    # 检查邮箱唯一性（如果提供了邮箱）
+    if "email" in update_data and update_data["email"] != db_user.email:
+        existing_user = db.query(models.User).filter(
+            models.User.email == update_data["email"],
+            models.User.id != user_id
         ).first()
-        if conflict:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="邮箱已被其他用户使用"
-            )
-        user.email = user_data.email
-
-    if user_data.full_name is not None:
-        user.full_name = user_data.full_name
-
-    if user_data.password is not None:
-        user.password_hash = user_data.password  # 注意：生产环境应使用哈希
-
-    if user_data.is_active is not None:
-        user.is_active = user_data.is_active
-
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # 更新字段
+    for field, value in update_data.items():
+        setattr(db_user, field, value)
+    
+    # 更新更新时间
+    db_user.updated_at = datetime.datetime.now()
+    
     db.commit()
-    db.refresh(user)
-    return user_to_response(user)
+    db.refresh(db_user)
+    return db_user
 
-@app.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Users"])
 def delete_user(user_id: int, db: Session = Depends(get_db)):
-    """删除用户"""
-    user = get_user_or_404(db, user_id)
-    db.delete(user)
+    """删除用户（软删除）"""
+    db_user = db.query(models.User).filter(models.User.id == user_id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # 软删除：将 is_active 设置为 False
+    db_user.is_active = False
+    db_user.updated_at = datetime.datetime.now()
+    
     db.commit()
     return None

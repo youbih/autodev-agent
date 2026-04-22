@@ -1,10 +1,11 @@
 import json
 
 from rich.console import Console
-from langchain_core.messages import SystemMessage, HumanMessage
 
 from autodev.workflow.llm import get_llm
 from autodev.workflow.state import ProjectState
+from autodev.agents.structured_output import invoke_json
+from autodev.agents.failure_control import record_failure
 
 console = Console()
 
@@ -13,7 +14,10 @@ def coder_node(state: ProjectState) -> ProjectState:
     console.print(f"[bold green][Coder][/bold green] 正在为项目 '{state['project_name']}' 编写业务代码...")
 
     llm = get_llm()
-    is_fixing = "errors" in state and len(state["errors"]) > 0
+    run = state.setdefault("run", {})
+    artifacts = state.setdefault("artifacts", {})
+    errors = run.get("errors") or []
+    is_fixing = len(errors) > 0
 
     architecture_type = str(state["spec"].get("architecture", "")).lower()
 
@@ -28,11 +32,15 @@ def coder_node(state: ProjectState) -> ProjectState:
 - 提供清晰的中文提示与必要的异常处理（输入校验等）
 
 输出要求：
-- 请仅输出一段包含 `main.py` 完整代码的 Markdown Python 代码块。"""
+- 你必须只输出一个严格 JSON 对象，不能输出 Markdown、不能输出代码块标记、不能输出任何额外文本。
+- JSON 格式必须为：{"files": {"app/main.py": "完整源码"}, "summary": "一句话摘要"}"""
     else:
         system_prompt = """你是一个高级 Python 后端工程师，擅长写 FastAPI 框架。
 架构师已经为你设计好了 `models.py` (SQLAlchemy) 和 `schemas.py` (Pydantic)。
 你的任务是编写 FastAPI 的入口文件 `main.py`，实现用户需求中的所有接口。
+
+【运行约定（必须遵守）】
+- main.py 必须暴露 FastAPI 实例变量名：app（即 app = FastAPI()）
 
 【导入规范（必须遵守）】
 - 项目内模块必须使用包导入：from app.xxx import ... 或 from app import xxx
@@ -45,7 +53,8 @@ def coder_node(state: ProjectState) -> ProjectState:
 - 禁止使用 app.core.database 或其他路径（比如 from app.core.database ... / from database ... 都不允许）
 
 输出要求：
-- 请仅输出一段包含 `main.py` 完整代码的 Markdown Python 代码块。"""
+- 你必须只输出一个严格 JSON 对象，不能输出 Markdown、不能输出代码块标记、不能输出任何额外文本。
+- JSON 格式必须为：{"files": {"app/main.py": "完整源码"}, "summary": "一句话摘要"}"""
 
     spec_str = json.dumps(state["spec"], ensure_ascii=False, indent=2)
     user_prompt = (
@@ -55,38 +64,28 @@ def coder_node(state: ProjectState) -> ProjectState:
     )
 
     if is_fixing:
-        error_msg = state["errors"][-1]
+        error_msg = errors[-1]
         console.print("[bold yellow][Coder][/bold yellow] 收到报错反馈，正在尝试修复...")
         user_prompt += (
             f"\n\n【警告】你之前写的代码报错了：\n{error_msg}\n"
             "请你仔细分析并提供修复后的完整 `main.py` 代码。"
         )
-        state["errors"] = []
-        state["files"]["fixed"] = "true"
+        run["errors"] = []
+        run.setdefault("flags", {})["fixed"] = True
 
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_prompt),
-    ]
+    parsed, raw_text = invoke_json(llm, system_prompt=system_prompt, user_prompt=user_prompt, max_attempts=3)
+    files = parsed.get("files") if isinstance(parsed, dict) else None
+    if isinstance(files, dict):
+        for p, c in files.items():
+            if isinstance(p, str) and isinstance(c, str):
+                artifacts[p] = c
+    run.setdefault("agent_summaries", {})["coder"] = str(parsed.get("summary") or "")
 
-    response = llm.invoke(messages)
-
-    lines = response.content.split("\n")
-    in_block = False
-    current_block = []
-    for line in lines:
-        if line.strip().startswith("```python"):
-            in_block = True
-            current_block = []
-        elif line.strip().startswith("```") and in_block:
-            in_block = False
-            state["files"]["app/main.py"] = "\n".join(current_block)
-            break
-        elif in_block:
-            current_block.append(line)
-
-    if "app/main.py" not in state["files"]:
+    if "app/main.py" not in artifacts:
         console.print("[bold red][Coder] ❌ 代码提取失败！[/bold red]")
+        run.setdefault("errors", [])
+        run["errors"].append(f"Coder JSON 输出解析失败:\n```text\n{raw_text}\n```")
+        record_failure(state, step="coder", reason="invalid_json_or_missing_main", detail=raw_text)
     else:
         console.print("[bold green][Coder][/bold green] ✅ main.py 业务代码编写完成！")
 
