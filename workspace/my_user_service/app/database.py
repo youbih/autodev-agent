@@ -1,37 +1,23 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker
 
-# SQLite database URL
+# SQLite数据库URL
 SQLALCHEMY_DATABASE_URL = "sqlite:///./my_user_service.db"
 
-# Create SQLAlchemy engine
+# 创建数据库引擎
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL,
-    connect_args={"check_same_thread": False},  # Needed for SQLite
-    echo=True  # Set to False in production
+    SQLALCHEMY_DATABASE_URL, 
+    connect_args={"check_same_thread": False},
+    echo=True  # 生产环境应设为False
 )
 
-# Create SessionLocal class
+# 创建SessionLocal类
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Dependency to get DB session
+# 依赖注入函数
 def get_db():
-    """
-    Dependency function to get database session.
-    Usage in FastAPI endpoints:
-    
-    @app.get("/users/{id}")
-    def read_user(id: int, db: Session = Depends(get_db)):
-        ...
-    """
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
-# Function to create all tables
-def create_tables():
-    """Create all database tables"""
-    from app.models import Base
-    Base.metadata.create_all(bind=engine)

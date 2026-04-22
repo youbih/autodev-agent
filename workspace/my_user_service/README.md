@@ -2,36 +2,39 @@
 
 ## 项目简介
 
-my_user_service 是一个基于 FastAPI 构建的现代化用户管理后端服务。该项目采用分层架构设计，实现了完整的用户 CRUD 操作，包括用户创建、查询、更新和软删除功能。服务使用 SQLite 作为数据库，通过 SQLAlchemy ORM 进行数据操作，并利用 Pydantic 模型进行数据验证和序列化。
+my_user_service 是一个基于 FastAPI 构建的现代化、高性能用户管理后端服务。该项目采用分层架构设计，实现了完整的用户 CRUD（创建、读取、更新、删除）操作，并提供了 RESTful API 接口。服务使用 SQLite 作为数据库，通过 SQLAlchemy ORM 进行数据操作，Pydantic 进行数据验证和序列化。
 
-## 核心架构图
+## 核心架构
+
+本项目采用经典的四层架构设计，确保代码的清晰分离和可维护性：
 
 ```mermaid
 graph TB
-    subgraph "API 层"
-        A[FastAPI 应用] --> B[路由端点]
-        B --> C[请求/响应模型]
+    subgraph "API 层 (Presentation Layer)"
+        A[FastAPI 路由] --> B[请求验证]
+        B --> C[响应序列化]
     end
     
-    subgraph "业务逻辑层"
-        D[服务函数] --> E[业务规则验证]
-        E --> F[数据转换]
+    subgraph "业务逻辑层 (Service Layer)"
+        D[用户服务] --> E[业务规则]
+        E --> F[数据验证]
     end
     
-    subgraph "数据访问层"
-        G[数据库会话] --> H[SQLAlchemy ORM]
-        H --> I[查询构建]
+    subgraph "数据访问层 (Repository Layer)"
+        G[SQLAlchemy Session] --> H[数据库操作]
+        H --> I[事务管理]
     end
     
-    subgraph "数据模型层"
+    subgraph "数据模型层 (Model Layer)"
         J[SQLAlchemy 模型] --> K[数据库表]
-        L[Pydantic Schema] --> M[数据验证]
+        L[Pydantic 模式] --> M[数据验证]
     end
     
-    C --> D
-    F --> G
-    I --> J
-    M --> C
+    A --> D
+    D --> G
+    G --> J
+    J --> L
+    L --> A
     
     style A fill:#e1f5fe
     style D fill:#f3e5f5
@@ -39,9 +42,9 @@ graph TB
     style J fill:#fff3e0
 ```
 
-## 环境依赖与安装步骤
+## 环境依赖与安装
 
-### 前置要求
+### 系统要求
 - Python 3.8+
 - pip 包管理器
 
@@ -56,9 +59,10 @@ graph TB
 2. **创建虚拟环境（推荐）**
    ```bash
    python -m venv venv
-   source venv/bin/activate  # Linux/Mac
-   # 或
-   venv\Scripts\activate     # Windows
+   # Windows
+   venv\Scripts\activate
+   # Linux/Mac
+   source venv/bin/activate
    ```
 
 3. **安装依赖**
@@ -66,161 +70,218 @@ graph TB
    pip install -r requirements.txt
    ```
 
-## 快速启动命令
-
-1. **启动开发服务器**
+4. **初始化数据库**
    ```bash
-   uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+   # 首次运行应用时会自动创建数据库表
+   python -m app.main
    ```
 
-2. **访问 API 文档**
-   - Swagger UI: http://localhost:8000/docs
-   - ReDoc: http://localhost:8000/redoc
+## 快速启动
 
-3. **验证服务运行状态**
-   ```bash
-   curl http://localhost:8000/
-   ```
-
-## 接口说明与 curl 示例
-
-### 1. 获取服务状态
-**端点**: `GET /`
-
-**curl 示例**:
+### 启动开发服务器
 ```bash
-curl -X GET "http://localhost:8000/"
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 2. 获取用户列表
-**端点**: `GET /users`
-**查询参数**:
-- `skip`: 跳过的记录数（默认: 0）
-- `limit`: 返回的最大记录数（默认: 100，最大: 100）
+### 访问 API 文档
+启动服务后，可以通过以下地址访问交互式 API 文档：
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
 
-**curl 示例**:
+### 运行测试
 ```bash
-curl -X GET "http://localhost:8000/users?skip=0&limit=10"
+# 运行所有测试
+pytest tests/
+
+# 运行特定测试文件
+pytest tests/test_main.py
+
+# 显示详细测试输出
+pytest -v
 ```
 
-### 3. 创建新用户
-**端点**: `POST /users`
-**请求体**:
+## 接口说明
+
+### 用户管理 API
+
+#### 1. 获取用户列表
+**GET** `/users`
+
+查询参数：
+- `skip` (可选): 跳过的记录数，默认 0
+- `limit` (可选): 返回的最大记录数，默认 100
+
+**cURL 示例：**
+```bash
+curl -X GET "http://localhost:8000/users?skip=0&limit=10" \
+     -H "Content-Type: application/json"
+```
+
+#### 2. 创建用户
+**POST** `/users`
+
+请求体：
 ```json
 {
   "username": "john_doe",
   "email": "john@example.com",
   "full_name": "John Doe",
-  "password": "securepassword123"
+  "password": "secure_password123",
+  "is_active": true
 }
 ```
 
-**curl 示例**:
+**cURL 示例：**
 ```bash
 curl -X POST "http://localhost:8000/users" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "username": "john_doe",
-    "email": "john@example.com",
-    "full_name": "John Doe",
-    "password": "securepassword123"
-  }'
+     -H "Content-Type: application/json" \
+     -d '{
+       "username": "john_doe",
+       "email": "john@example.com",
+       "full_name": "John Doe",
+       "password": "secure_password123",
+       "is_active": true
+     }'
 ```
 
-### 4. 获取指定用户
-**端点**: `GET /users/{user_id}`
-**路径参数**:
-- `user_id`: 用户 ID
+#### 3. 获取单个用户
+**GET** `/users/{id}`
 
-**curl 示例**:
+路径参数：
+- `id`: 用户 ID
+
+**cURL 示例：**
 ```bash
-curl -X GET "http://localhost:8000/users/1"
+curl -X GET "http://localhost:8000/users/1" \
+     -H "Content-Type: application/json"
 ```
 
-### 5. 更新用户信息
-**端点**: `PUT /users/{user_id}`
-**路径参数**:
-- `user_id`: 用户 ID
+#### 4. 更新用户
+**PUT** `/users/{id}`
 
-**请求体（部分更新示例）**:
+路径参数：
+- `id`: 用户 ID
+
+请求体（支持部分更新）：
 ```json
 {
-  "full_name": "John Smith",
-  "email": "john.smith@example.com"
+  "username": "updated_username",
+  "email": "updated@example.com",
+  "full_name": "Updated Name",
+  "password": "new_password",
+  "is_active": false
 }
 ```
 
-**curl 示例**:
+**cURL 示例：**
 ```bash
 curl -X PUT "http://localhost:8000/users/1" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "full_name": "John Smith",
-    "email": "john.smith@example.com"
-  }'
+     -H "Content-Type: application/json" \
+     -d '{
+       "username": "updated_username",
+       "email": "updated@example.com",
+       "full_name": "Updated Name"
+     }'
 ```
 
-### 6. 删除用户（软删除）
-**端点**: `DELETE /users/{user_id}`
-**路径参数**:
-- `user_id`: 用户 ID
+#### 5. 删除用户
+**DELETE** `/users/{id}`
 
-**注意**: 此操作为软删除，仅将用户的 `is_active` 字段设置为 `false`
+路径参数：
+- `id`: 用户 ID
 
-**curl 示例**:
+**cURL 示例：**
 ```bash
-curl -X DELETE "http://localhost:8000/users/1"
+curl -X DELETE "http://localhost:8000/users/1" \
+     -H "Content-Type: application/json"
 ```
+
+### 响应格式
+所有成功响应都遵循以下格式：
+```json
+{
+  "id": 1,
+  "username": "john_doe",
+  "email": "john@example.com",
+  "full_name": "John Doe",
+  "is_active": true,
+  "created_at": "2024-01-01T12:00:00Z",
+  "updated_at": "2024-01-01T12:00:00Z"
+}
+```
+
+### 错误处理
+服务返回标准 HTTP 状态码：
+- `200 OK`: 请求成功
+- `201 Created`: 资源创建成功
+- `204 No Content`: 删除成功
+- `400 Bad Request`: 请求参数错误或数据冲突
+- `404 Not Found`: 资源不存在
+- `500 Internal Server Error`: 服务器内部错误
 
 ## 项目结构
-
 ```
 my_user_service/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py           # FastAPI 应用入口
+│   ├── main.py           # FastAPI 应用入口和路由
 │   ├── models.py         # SQLAlchemy 数据模型
-│   ├── schemas.py        # Pydantic 数据验证模型
+│   ├── schemas.py        # Pydantic 数据模式
 │   └── database.py       # 数据库配置和会话管理
+├── tests/
+│   └── test_main.py      # API 测试用例
 ├── requirements.txt      # 项目依赖
-├── my_user_service.db    # SQLite 数据库文件（自动生成）
-└── README.md            # 项目文档
+├── README.md            # 项目文档
+└── my_user_service.db   # SQLite 数据库文件（运行后生成）
 ```
 
-## 数据模型
+## 安全说明
 
-### User 表结构
-| 字段名 | 类型 | 描述 |
-|--------|------|------|
-| id | Integer | 主键，自增 |
-| username | String(50) | 用户名，唯一索引 |
-| email | String(100) | 邮箱地址，唯一索引 |
-| full_name | String(100) | 全名（可选） |
-| hashed_password | String(255) | 哈希后的密码 |
-| is_active | Boolean | 用户激活状态 |
-| created_at | DateTime | 创建时间 |
-| updated_at | DateTime | 更新时间 |
+⚠️ **重要安全提示**
 
-## 注意事项
+当前版本使用简化密码哈希处理（仅添加 "_hashed" 后缀），**不适用于生产环境**。在生产部署前，必须：
 
-1. **密码安全**: 当前实现中密码哈希处理为简化版本，生产环境应使用 `bcrypt` 或 `argon2` 等安全哈希算法
-2. **数据库**: 默认使用 SQLite 文件数据库，生产环境建议迁移到 PostgreSQL 或 MySQL
-3. **分页**: 用户列表接口支持分页，最大返回 100 条记录
-4. **软删除**: 删除操作仅标记用户为未激活状态，数据仍保留在数据库中
+1. 使用安全的密码哈希算法（如 bcrypt、Argon2）
+2. 添加适当的密码强度验证
+3. 实现 HTTPS 加密传输
+4. 添加身份验证和授权机制
+5. 配置适当的 CORS 策略
 
 ## 开发说明
 
-- 数据库表会在应用启动时自动创建
-- 开发模式下 SQLAlchemy 会输出所有 SQL 语句（可通过设置 `echo=False` 关闭）
-- 所有 API 端点都支持 Swagger UI 和 ReDoc 文档
-- 数据验证通过 Pydantic 模型自动处理
+### 数据库迁移
+对于生产环境，建议使用 Alembic 进行数据库迁移管理：
+```bash
+# 安装 Alembic
+pip install alembic
 
-## 故障排除
+# 初始化迁移环境
+alembic init migrations
 
-1. **端口冲突**: 如果 8000 端口被占用，可通过 `--port` 参数指定其他端口
-2. **数据库连接错误**: 确保有写入权限，可删除 `my_user_service.db` 文件后重启服务
-3. **导入错误**: 确保在项目根目录下运行，或正确设置 Python 路径
+# 创建迁移脚本
+alembic revision --autogenerate -m "Initial migration"
+
+# 应用迁移
+alembic upgrade head
+```
+
+### 配置管理
+当前使用硬编码配置，建议使用环境变量或配置文件：
+```python
+import os
+
+SQLALCHEMY_DATABASE_URL = os.getenv(
+    "DATABASE_URL", 
+    "sqlite:///./my_user_service.db"
+)
+```
+
+### 性能优化
+- 生产环境应将 `echo=True` 改为 `False` 以减少日志输出
+- 考虑使用连接池管理数据库连接
+- 实现适当的缓存策略
+- 添加 API 限流和请求频率限制
 
 ## 许可证
 
-本项目仅供学习参考，可根据实际需求进行修改和使用。
+本项目采用 MIT 许可证。详见 LICENSE 文件。
