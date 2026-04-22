@@ -4,99 +4,166 @@ from autodev.workflow.state import ProjectState
 from rich.console import Console
 from langchain_core.prompts import ChatPromptTemplate
 from autodev.workflow.llm import get_llm
-
+import subprocess
+import os
+import tempfile
+from pathlib import Path
+from langchain_core.messages import SystemMessage, HumanMessage
 console = Console()
 
 # --- 真实的 Architect 节点 ---
 def architect_node(state: ProjectState) -> ProjectState:
     console.print(f"[bold blue][Architect][/bold blue] 正在思考项目 '{state['project_name']}' 的系统架构...")
     
+    architecture_type = str(state['spec'].get('architecture', '')).lower()
+    if '单文件脚本' in architecture_type or 'script' in architecture_type:
+        console.print("[bold blue][Architect][/bold blue] 检测到这是一个简单脚本项目，架构师无需设计复杂模型，直接交接给 Coder！")
+        state["architect_design"] = "这是一个单文件 Python 脚本项目，不需要数据库设计，请在一个文件内完成所有逻辑。"
+        return state
+        
     llm = get_llm()
-    
-    # 1. 编写架构师的 System Prompt
     system_prompt = """你是一个资深的 Python 后端架构师。
 你的任务是根据用户的项目需求 (Spec)，设计出合理的数据库模型 (SQLAlchemy) 和 API 数据结构 (Pydantic)。
 请以纯文本的 Markdown 格式输出设计思路，并在其中包含且仅包含两段 Python 代码块：
 1. 第一段代码块必须是 `models.py` (SQLAlchemy 结构)
-2. 第二段代码块必须是 `schemas.py` (Pydantic 结构)
+2. 第二段代码块必须是 `schemas.py` (Pydantic 结构)"""
 
-请保持代码规范，包含必要的字段，并加上详细的中文注释。"""
-
-    user_prompt = "这是项目的需求配置 (Spec):\n{spec_json}"
+    # 不再用 f-string 模板，直接转成 JSON 字符串拼接
+    spec_str = json.dumps(state['spec'], ensure_ascii=False, indent=2)
+    user_prompt = f"这是项目的需求配置 (Spec):\n{spec_str}"
     
-    prompt_template = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("user", user_prompt)
-    ])
+    # 直接组装 Messages，绕开 ChatPromptTemplate
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ]
     
-    # 2. 调用大模型
-    chain = prompt_template | llm
-    response = chain.invoke({"spec_json": json.dumps(state["spec"], ensure_ascii=False, indent=2)})
+    response = llm.invoke(messages)
     
-    design_content = response.content
-    
-    # 3. 解析大模型返回的代码块 (简单写一个提取 Markdown Python 代码块的逻辑)
     code_blocks = []
-    lines = design_content.split('\n')
-    in_block = False
-    current_block = []
-    
+    lines = response.content.split('\n')
+    in_block = False; current_block = []
     for line in lines:
-        if line.strip().startswith("```python"):
-            in_block = True
-            current_block = []
-        elif line.strip().startswith("```") and in_block:
-            in_block = False
-            code_blocks.append('\n'.join(current_block))
-        elif in_block:
-            current_block.append(line)
+        if line.strip().startswith("```python"): in_block = True; current_block = []
+        elif line.strip().startswith("```") and in_block: in_block = False; code_blocks.append('\n'.join(current_block))
+        elif in_block: current_block.append(line)
             
-    # 4. 把提取到的代码存入全局状态 (State)
     if len(code_blocks) >= 2:
         state["files"]["app/models.py"] = code_blocks[0]
         state["files"]["app/schemas.py"] = code_blocks[1]
         console.print("[bold blue][Architect][/bold blue] ✅ 数据库模型和数据结构设计完成！")
     else:
-        console.print("[bold red][Architect] ❌ 架构师没有按格式输出两段代码块！[/bold red]")
-        # 兜底：如果没有正确输出，就存一点假代码防止流程断掉
-        state["files"]["app/models.py"] = "# LLM 解析失败，需重试"
-        state["files"]["app/schemas.py"] = "# LLM 解析失败，需重试"
+        state["files"]["app/models.py"] = "# 需重试"
+        state["files"]["app/schemas.py"] = "# 需重试"
 
-    # 把架构师的原始思考过程也存下来，以后可以写进 README
-    state["architect_design"] = design_content
-    
+    state["architect_design"] = response.content
     return state
 
 def coder_node(state: ProjectState) -> ProjectState:
-    console.print("[bold green][Coder][/bold green] 正在编写 FastAPI 业务代码...")
+    console.print(f"[bold green][Coder][/bold green] 正在为项目 '{state['project_name']}' 编写业务代码...")
     
-    # 检查是否是从 QA 节点“打回”来修复的
-    if "errors" in state and len(state["errors"]) > 0:
-        console.print(f"[bold yellow][Coder][/bold yellow] 收到报错信息，正在尝试修复: {state['errors'][-1]}")
-        # Mock: 假装修复了错误，关键是我们要把 errors 清空！
+    llm = get_llm()
+    is_fixing = "errors" in state and len(state["errors"]) > 0
+    
+    architecture_type = str(state['spec'].get('architecture', '')).lower()
+    
+    if '单文件脚本' in architecture_type or 'script' in architecture_type:
+        system_prompt = """你是一个全能的 Python 极客工程师。
+用户的需求是一个纯命令行的 Python 脚本程序。绝对不要使用任何 Web 框架 (如 FastAPI) 或复杂的数据库 (如 SQLAlchemy)！
+你需要将所有的逻辑完整地写在一个文件里。
+请仅输出一段包含 `main.py` 完整代码的 Markdown Python 代码块。"""
+    else:
+        system_prompt = """你是一个高级 Python 后端工程师，擅长写 FastAPI 框架。
+架构师已经为你设计好了 `models.py` (SQLAlchemy) 和 `schemas.py` (Pydantic)。
+你的任务是编写 FastAPI 的入口文件 `main.py`，实现用户需求中的所有接口。
+请仅输出一段包含 `main.py` 完整代码的 Markdown Python 代码块。"""
+
+    spec_str = json.dumps(state['spec'], ensure_ascii=False, indent=2)
+    user_prompt = f"这是用户的需求 (Spec):\n{spec_str}\n\n这是架构师的设计思路:\n{state.get('architect_design', '无')}\n\n请你编写 `main.py`。"
+
+    if is_fixing:
+        error_msg = state['errors'][-1]
+        console.print(f"[bold yellow][Coder][/bold yellow] 收到报错反馈，正在尝试修复...")
+        user_prompt += f"\n\n【警告】你之前写的代码报错了：\n{error_msg}\n请你仔细分析并提供修复后的完整 `main.py` 代码。"
         state["errors"] = []
-        # 给 QA 留个记号，告诉它我们修复过了
-        state["files"]["fixed"] = "true" 
+        state["files"]["fixed"] = "true"
+        
+    # 直接组装 Messages，绕开 ChatPromptTemplate
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ]
     
-    # Mock: 生成业务代码
-    state["files"]["app/main.py"] = "from fastapi import FastAPI\napp = FastAPI()"
-    state["files"]["tests/test_api.py"] = "def test_ping(): assert True"
+    response = llm.invoke(messages)
     
+    lines = response.content.split('\n')
+    in_block = False; current_block = []
+    for line in lines:
+        if line.strip().startswith("```python"): in_block = True; current_block = []
+        elif line.strip().startswith("```") and in_block:
+            in_block = False
+            state["files"]["app/main.py"] = '\n'.join(current_block)
+            break
+        elif in_block: current_block.append(line)
+            
+    if "app/main.py" not in state["files"]:
+        console.print("[bold red][Coder] ❌ 代码提取失败！[/bold red]")
+    else:
+        console.print("[bold green][Coder][/bold green] ✅ main.py 业务代码编写完成！")
+
     return state
 
 def qa_node(state: ProjectState) -> ProjectState:
-    console.print("[bold red][QA][/bold red] 正在沙盒中安装依赖并运行 pytest...")
+    console.print(f"[bold red][QA][/bold red] 正在沙盒中执行真实的语法检查...")
     
-    # 核心修复逻辑：
-    # 如果 files 里没有 "fixed" 标记，说明这是第一次运行，我们故意报错
-    if "fixed" not in state.get("files", {}):
-        console.print("[bold red][QA] ❌ 测试失败！发现 Pydantic schemas 导入错误。[/bold red]")
-        state["errors"] = ["ImportError: cannot import name 'UserCreate' from 'app.schemas'"]
-        state["test_passed"] = False
-        return state
-             
-    # 如果有了 "fixed" 标记，说明 Coder 已经尝试修复过了，这次我们让它通过
-    console.print("[bold green][QA] ✅ 测试全绿！代码验证通过。[/bold green]")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        
+        # 1. 将 state["files"] 里生成的所有代码，真实地写入临时目录
+        for file_path, content in state["files"].items():
+            if file_path == "fixed": # 忽略标记位
+                continue
+            full_path = temp_path / file_path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(content)
+                
+        # 2. 我们降级检查策略：只用 py_compile 检查主文件是否有基础语法错误，不进行 import
+        # 因为 import 会受限于当前环境是否安装了 FastAPI 等依赖
+        main_file = temp_path / "app/main.py"
+        if not main_file.exists():
+            state["test_passed"] = False
+            state["errors"] = ["缺少 app/main.py 文件"]
+            return state
+
+        check_cmd = ["python", "-m", "py_compile", str(main_file)]
+        
+        console.print(f"[bold red][QA][/bold red] 执行语法检查: {' '.join(check_cmd)}")
+        result = subprocess.run(
+            check_cmd,
+            cwd=str(temp_path),
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            error_log = result.stderr.strip()
+            if len(error_log) > 500:
+                error_log = "..." + error_log[-500:]
+                
+            console.print(f"[bold red][QA] ❌ 真实运行报错！发现代码存在语法错误。[/bold red]")
+            console.print(f"[dim]{error_log}[/dim]")
+            
+            state["errors"] = [f"语法检查失败:\n```text\n{error_log}\n```"]
+            state["test_passed"] = False
+            return state
+
+    console.print("[bold green][QA] ✅ 真实环境验证全绿！代码语法正确。[/bold green]")
+    state["test_passed"] = True
+    return state
+
+    # 如果 subprocess 返回 0，说明没有任何语法和导入错误
+    console.print("[bold green][QA] ✅ 真实环境验证全绿！代码语法及依赖导入正确。[/bold green]")
     state["test_passed"] = True
     return state
 
@@ -104,10 +171,49 @@ def qa_node(state: ProjectState) -> ProjectState:
 
 
 def tech_writer_node(state: ProjectState) -> ProjectState:
-    console.print("[bold magenta][TechWriter][/bold magenta] 正在生成含 Mermaid 架构图的 README.md...")
-    # Mock: 生成 README
-    state["readme_content"] = f"# {state['project_name']}\n\n这是自动生成的后端项目。\n\n```mermaid\ngraph TD;\nAPI-->Service;\n```"
-    state["files"]["README.md"] = state["readme_content"]
+    console.print(f"[bold magenta][TechWriter][/bold magenta] 正在阅读生成的代码，推导架构并生成专业的 README.md...")
+    
+    llm = get_llm()
+    
+    # 1. 准备大模型阅读的“代码库”上下文
+    code_context = ""
+    for file_path, content in state["files"].items():
+        if file_path == "fixed": continue
+        code_context += f"--- {file_path} ---\n```python\n{content}\n```\n\n"
+        
+    # 2. 编写文档工程师的 System Prompt
+    system_prompt = """你是一个高级技术文档工程师 (Technical Writer)。
+开发团队刚刚为你提供了一个基于 FastAPI 编写的完整项目代码。
+你的任务是阅读这些代码，然后编写一份极致专业的项目 `README.md` 文档。
+
+要求 README 必须包含以下结构：
+1. **项目名称与简介** (从 Spec 中提取)
+2. **核心架构图 (Mermaid)**: 根据你阅读的 models, schemas, main.py 逻辑，使用 mermaid 的 graph TD 语法画出组件交互图或 ER 模型图。必须把 mermaid 放在 ```mermaid 代码块里。
+3. **环境依赖**: 明确列出如何创建虚拟环境，以及需要安装的依赖 (如 fastapi, uvicorn, sqlalchemy 等)。
+4. **快速启动**: 写出启动 uvicorn 服务的具体命令。
+5. **接口说明**: 列出主要的 API 路由 (Endpoints) 及对应的 curl 测试命令。
+
+只输出完整的 Markdown 文档，不要包含任何多余的废话。"""
+
+    # 这里我们不用 f-string template，直接拼好最终的字符串
+    spec_str = json.dumps(state['spec'], ensure_ascii=False, indent=2)
+    user_prompt = f"这是项目的需求 (Spec):\n{spec_str}\n\n这是开发团队生成的完整项目代码:\n{code_context}\n\n请你开始撰写 README.md！"
+
+    # 3. 手动构建消息列表（避免 LangChain 的模板花括号解析冲突）
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ]
+    
+    # 4. 调用大模型
+    response = llm.invoke(messages)
+    
+    # 5. 把大模型生成的文档保存下来
+    state["readme_content"] = response.content
+    state["files"]["README.md"] = response.content
+    
+    console.print("[bold magenta][TechWriter][/bold magenta] ✅ 专业文档生成完成！")
+    
     return state
 
 # --- 边定义 (Routing Logic) ---
