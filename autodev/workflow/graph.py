@@ -9,18 +9,59 @@ import os
 import tempfile
 from pathlib import Path
 from langchain_core.messages import SystemMessage, HumanMessage
+import docker
+from docker.errors import ContainerError, ImageNotFound, APIError
+import sys
+import autodev.workflow.graph as g
 console = Console()
+
+# 获取当前工作目录（你运行命令的那个目录，即 autodev_project）
+PROJECT_ROOT = Path(os.getcwd()).absolute()
+
+# 全部使用绝对路径！
+QA_ROOT = PROJECT_ROOT / ".autodev"
+QA_VENV = QA_ROOT / "qa_venv"
+QA_MARKER = QA_ROOT / ".deps_installed"
+PIP_CACHE = QA_ROOT / "pip_cache"
+QA_DEPS = ["fastapi", "uvicorn", "sqlalchemy", "pydantic"]
+
+def _qa_python_path() -> Path:
+    if os.name == "nt":
+        return QA_VENV / "Scripts" / "python.exe"
+    return QA_VENV / "bin" / "python"
+
+def ensure_qa_venv() -> str:
+    QA_ROOT.mkdir(parents=True, exist_ok=True)
+    PIP_CACHE.mkdir(parents=True, exist_ok=True)
+
+    py = _qa_python_path()
+
+    if not py.exists():
+        console.print("[bold red][QA][/bold red] 初始化 QA 缓存 venv...")
+        subprocess.run([sys.executable, "-m", "venv", str(QA_VENV)], check=True)
+
+    if not QA_MARKER.exists():
+        console.print("[bold red][QA][/bold red] 首次安装 QA 依赖（只会发生一次）...")
+        env = os.environ.copy()
+        env["PIP_CACHE_DIR"] = str(PIP_CACHE)
+
+        subprocess.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True, env=env)
+        subprocess.run([str(py), "-m", "pip", "install", *QA_DEPS], check=True, env=env)
+
+        QA_MARKER.write_text("\n".join(QA_DEPS), encoding="utf-8")
+
+    return str(py)
 
 # --- 真实的 Architect 节点 ---
 def architect_node(state: ProjectState) -> ProjectState:
     console.print(f"[bold blue][Architect][/bold blue] 正在思考项目 '{state['project_name']}' 的系统架构...")
-    
-    architecture_type = str(state['spec'].get('architecture', '')).lower()
-    if '单文件脚本' in architecture_type or 'script' in architecture_type:
+
+    architecture_type = str(state["spec"].get("architecture", "")).lower()
+    if "单文件脚本" in architecture_type or "script" in architecture_type:
         console.print("[bold blue][Architect][/bold blue] 检测到这是一个简单脚本项目，架构师无需设计复杂模型，直接交接给 Coder！")
         state["architect_design"] = "这是一个单文件 Python 脚本项目，不需要数据库设计，请在一个文件内完成所有逻辑。"
         return state
-        
+
     llm = get_llm()
     system_prompt = """你是一个资深的 Python 后端架构师。
 你的任务是根据用户的项目需求 (Spec)，设计出合理的数据库模型 (SQLAlchemy) 和 API 数据结构 (Pydantic)。
@@ -28,26 +69,38 @@ def architect_node(state: ProjectState) -> ProjectState:
 1. 第一段代码块必须是 `models.py` (SQLAlchemy 结构)
 2. 第二段代码块必须是 `schemas.py` (Pydantic 结构)"""
 
-    # 不再用 f-string 模板，直接转成 JSON 字符串拼接
-    spec_str = json.dumps(state['spec'], ensure_ascii=False, indent=2)
+    spec_str = json.dumps(state["spec"], ensure_ascii=False, indent=2)
     user_prompt = f"这是项目的需求配置 (Spec):\n{spec_str}"
-    
-    # 直接组装 Messages，绕开 ChatPromptTemplate
+
+    if state.get("human_feedback"):
+        console.print(f"[bold yellow][Architect][/bold yellow] 收到老板的修改意见：'{state['human_feedback']}'，正在重做架构设计...")
+        user_prompt += (
+            f"\n\n【重要】用户对你上次的设计提出了修改意见：\n{state['human_feedback']}\n"
+            "请你反思上次的设计，并严格根据意见重新输出设计思路和完整的代码块！"
+        )
+        state["human_feedback"] = ""
+
     messages = [
         SystemMessage(content=system_prompt),
-        HumanMessage(content=user_prompt)
+        HumanMessage(content=user_prompt),
     ]
-    
+
     response = llm.invoke(messages)
-    
+
     code_blocks = []
-    lines = response.content.split('\n')
-    in_block = False; current_block = []
+    lines = response.content.split("\n")
+    in_block = False
+    current_block = []
     for line in lines:
-        if line.strip().startswith("```python"): in_block = True; current_block = []
-        elif line.strip().startswith("```") and in_block: in_block = False; code_blocks.append('\n'.join(current_block))
-        elif in_block: current_block.append(line)
-            
+        if line.strip().startswith("```python"):
+            in_block = True
+            current_block = []
+        elif line.strip().startswith("```") and in_block:
+            in_block = False
+            code_blocks.append("\n".join(current_block))
+        elif in_block:
+            current_block.append(line)
+
     if len(code_blocks) >= 2:
         state["files"]["app/models.py"] = code_blocks[0]
         state["files"]["app/schemas.py"] = code_blocks[1]
@@ -57,55 +110,118 @@ def architect_node(state: ProjectState) -> ProjectState:
         state["files"]["app/schemas.py"] = "# 需重试"
 
     state["architect_design"] = response.content
+
+    if "app/database.py" not in state["files"]:
+        state["files"]["app/database.py"] = """from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = "sqlite:///./app.db"
+
+engine = create_engine(
+    DATABASE_URL, connect_args={"check_same_thread": False}
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+"""
+
     return state
+
+def human_review_node(state: ProjectState) -> ProjectState:
+    # 只有非简单脚本（也就是有架构设计输出的），才需要审查
+    architecture_type = str(state['spec'].get('architecture', '')).lower()
+    if '单文件脚本' in architecture_type or 'script' in architecture_type:
+        return state
+        
+    console.print("\n[bold cyan]================ 👨‍💻 人工审查环节 =================[/bold cyan]")
+    console.print(f"[dim]{state.get('architect_design', '无设计稿')}[/dim]")
+    console.print("[bold cyan]==================================================[/bold cyan]")
+    
+    # 暂停程序的执行，等待用户在终端输入
+    feedback = console.input("[bold yellow]架构设计是否通过？(输入 'y' 或直接回车同意，输入具体的修改意见让架构师重做): [/bold yellow]")
+    
+    if feedback.strip().lower() in ['y', 'yes', 'ok', '']:
+        state["human_feedback"] = ""  # 同意放行
+    else:
+        state["human_feedback"] = feedback  # 记录意见，准备打回
+        
+    return state
+
 
 def coder_node(state: ProjectState) -> ProjectState:
     console.print(f"[bold green][Coder][/bold green] 正在为项目 '{state['project_name']}' 编写业务代码...")
-    
+
     llm = get_llm()
     is_fixing = "errors" in state and len(state["errors"]) > 0
-    
-    architecture_type = str(state['spec'].get('architecture', '')).lower()
-    
-    if '单文件脚本' in architecture_type or 'script' in architecture_type:
+
+    architecture_type = str(state["spec"].get("architecture", "")).lower()
+
+    if "单文件脚本" in architecture_type or "script" in architecture_type:
         system_prompt = """你是一个全能的 Python 极客工程师。
 用户的需求是一个纯命令行的 Python 脚本程序。绝对不要使用任何 Web 框架 (如 FastAPI) 或复杂的数据库 (如 SQLAlchemy)！
 你需要将所有的逻辑完整地写在一个文件里。
-请仅输出一段包含 `main.py` 完整代码的 Markdown Python 代码块。"""
+
+要求：
+- 仅使用 Python 标准库
+- 使用 input()/print() 进行交互
+- 提供清晰的中文提示与必要的异常处理（输入校验等）
+
+输出要求：
+- 请仅输出一段包含 `main.py` 完整代码的 Markdown Python 代码块。"""
     else:
         system_prompt = """你是一个高级 Python 后端工程师，擅长写 FastAPI 框架。
 架构师已经为你设计好了 `models.py` (SQLAlchemy) 和 `schemas.py` (Pydantic)。
 你的任务是编写 FastAPI 的入口文件 `main.py`，实现用户需求中的所有接口。
-请仅输出一段包含 `main.py` 完整代码的 Markdown Python 代码块。"""
 
-    spec_str = json.dumps(state['spec'], ensure_ascii=False, indent=2)
-    user_prompt = f"这是用户的需求 (Spec):\n{spec_str}\n\n这是架构师的设计思路:\n{state.get('architect_design', '无')}\n\n请你编写 `main.py`。"
+【导入规范（必须遵守）】
+- 项目内模块必须使用包导入：from app.xxx import ... 或 from app import xxx
+- 严禁使用裸导入：import models / import schemas / import database
+- 除标准库/第三方库外，main.py 中所有本地模块导入必须以 app. 开头（例如 from app.models import User）
+
+【数据库模块约定（必须遵守）】
+- 数据库连接模块固定为 app/database.py
+- 如需使用 SessionLocal/engine，必须写：from app.database import SessionLocal, engine
+- 禁止使用 app.core.database 或其他路径（比如 from app.core.database ... / from database ... 都不允许）
+
+输出要求：
+- 请仅输出一段包含 `main.py` 完整代码的 Markdown Python 代码块。"""
+
+    spec_str = json.dumps(state["spec"], ensure_ascii=False, indent=2)
+    user_prompt = (
+        f"这是用户的需求 (Spec):\n{spec_str}\n\n"
+        f"这是架构师的设计思路:\n{state.get('architect_design', '无')}\n\n"
+        "请你编写 `main.py`。"
+    )
 
     if is_fixing:
-        error_msg = state['errors'][-1]
-        console.print(f"[bold yellow][Coder][/bold yellow] 收到报错反馈，正在尝试修复...")
-        user_prompt += f"\n\n【警告】你之前写的代码报错了：\n{error_msg}\n请你仔细分析并提供修复后的完整 `main.py` 代码。"
+        error_msg = state["errors"][-1]
+        console.print("[bold yellow][Coder][/bold yellow] 收到报错反馈，正在尝试修复...")
+        user_prompt += (
+            f"\n\n【警告】你之前写的代码报错了：\n{error_msg}\n"
+            "请你仔细分析并提供修复后的完整 `main.py` 代码。"
+        )
         state["errors"] = []
         state["files"]["fixed"] = "true"
-        
-    # 直接组装 Messages，绕开 ChatPromptTemplate
+
     messages = [
         SystemMessage(content=system_prompt),
-        HumanMessage(content=user_prompt)
+        HumanMessage(content=user_prompt),
     ]
-    
+
     response = llm.invoke(messages)
-    
-    lines = response.content.split('\n')
-    in_block = False; current_block = []
+
+    lines = response.content.split("\n")
+    in_block = False
+    current_block = []
     for line in lines:
-        if line.strip().startswith("```python"): in_block = True; current_block = []
+        if line.strip().startswith("```python"):
+            in_block = True
+            current_block = []
         elif line.strip().startswith("```") and in_block:
             in_block = False
-            state["files"]["app/main.py"] = '\n'.join(current_block)
+            state["files"]["app/main.py"] = "\n".join(current_block)
             break
-        elif in_block: current_block.append(line)
-            
+        elif in_block:
+            current_block.append(line)
+
     if "app/main.py" not in state["files"]:
         console.print("[bold red][Coder] ❌ 代码提取失败！[/bold red]")
     else:
@@ -114,56 +230,53 @@ def coder_node(state: ProjectState) -> ProjectState:
     return state
 
 def qa_node(state: ProjectState) -> ProjectState:
-    console.print(f"[bold red][QA][/bold red] 正在沙盒中执行真实的语法检查...")
-    
+    console.print("[bold red][QA][/bold red] 使用缓存 venv 执行隔离验证...")
+
+    qa_python = ensure_qa_venv()
+    console.print(f"[bold red][QA][/bold red] 使用的解释器: {qa_python}")
+    console.print(f"[QA] graph.py 路径: {g.__file__}")
+    console.print(f"[QA] QA_VENV: {QA_VENV}")
+    console.print(f"[QA] qa_python: {qa_python}")
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
-        
-        # 1. 将 state["files"] 里生成的所有代码，真实地写入临时目录
+
         for file_path, content in state["files"].items():
-            if file_path == "fixed": # 忽略标记位
+            if file_path == "fixed":
                 continue
             full_path = temp_path / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(full_path, "w", encoding="utf-8") as f:
-                f.write(content)
-                
-        # 2. 我们降级检查策略：只用 py_compile 检查主文件是否有基础语法错误，不进行 import
-        # 因为 import 会受限于当前环境是否安装了 FastAPI 等依赖
-        main_file = temp_path / "app/main.py"
-        if not main_file.exists():
-            state["test_passed"] = False
-            state["errors"] = ["缺少 app/main.py 文件"]
-            return state
+            full_path.write_text(content, encoding="utf-8")
 
-        check_cmd = ["python", "-m", "py_compile", str(main_file)]
-        
-        console.print(f"[bold red][QA][/bold red] 执行语法检查: {' '.join(check_cmd)}")
+        architecture_type = str(state["spec"].get("architecture", "")).lower()
+
+        if "单文件脚本" in architecture_type or "script" in architecture_type:
+            check_cmd = [qa_python, "-m", "py_compile", "app/main.py"]
+        else:
+            check_cmd = [
+                qa_python,
+                "-c",
+                "import sys; sys.path.insert(0, '.'); import app.main",
+            ]
+
+        console.print(f"[bold red][QA][/bold red] 执行: {' '.join(check_cmd)}")
         result = subprocess.run(
             check_cmd,
             cwd=str(temp_path),
             capture_output=True,
-            text=True
+            text=True,
         )
-        
+
         if result.returncode != 0:
-            error_log = result.stderr.strip()
-            if len(error_log) > 500:
-                error_log = "..." + error_log[-500:]
-                
-            console.print(f"[bold red][QA] ❌ 真实运行报错！发现代码存在语法错误。[/bold red]")
+            error_log = (result.stderr or result.stdout or "").strip()
+            if len(error_log) > 800:
+                error_log = "..." + error_log[-800:]
+            console.print("[bold red][QA] ❌ 沙盒验证失败[/bold red]")
             console.print(f"[dim]{error_log}[/dim]")
-            
-            state["errors"] = [f"语法检查失败:\n```text\n{error_log}\n```"]
+            state["errors"] = [f"QA 验证失败:\n```text\n{error_log}\n```"]
             state["test_passed"] = False
             return state
 
-    console.print("[bold green][QA] ✅ 真实环境验证全绿！代码语法正确。[/bold green]")
-    state["test_passed"] = True
-    return state
-
-    # 如果 subprocess 返回 0，说明没有任何语法和导入错误
-    console.print("[bold green][QA] ✅ 真实环境验证全绿！代码语法及依赖导入正确。[/bold green]")
+    console.print("[bold green][QA] ✅ 沙盒验证通过[/bold green]")
     state["test_passed"] = True
     return state
 
@@ -225,30 +338,45 @@ def route_after_qa(state: ProjectState) -> str:
     return "tech_writer"
 
 # --- 构建图 ---
+def route_after_review(state: ProjectState) -> str:
+    """如果有人类意见，就打回给 architect；否则放行给 coder"""
+    if state.get("human_feedback"):
+        return "architect"
+    return "coder"
+
 def build_graph():
     workflow = StateGraph(ProjectState)
     
-    # 1. 添加节点
+    # 添加节点
     workflow.add_node("architect", architect_node)
+    workflow.add_node("human_review", human_review_node)  # <--- 增加新节点
     workflow.add_node("coder", coder_node)
     workflow.add_node("qa", qa_node)
     workflow.add_node("tech_writer", tech_writer_node)
     
-    # 2. 定义流转边
+    # 连线
     workflow.set_entry_point("architect")
-    workflow.add_edge("architect", "coder")
-    workflow.add_edge("coder", "qa")
+    workflow.add_edge("architect", "human_review")        # Architect 完事后，先给人看
     
-    # QA 节点是条件路由 (Conditional Edge)
+    # 人类看完后，条件路由
+    workflow.add_conditional_edges(
+        "human_review",
+        route_after_review,
+        {
+            "architect": "architect",  # 打回重做
+            "coder": "coder"           # 同意放行
+        }
+    )
+    
+    workflow.add_edge("coder", "qa")
     workflow.add_conditional_edges(
         "qa",
         route_after_qa,
         {
-            "coder": "coder",               # 返回重写
-            "tech_writer": "tech_writer"    # 去写文档
+            "coder": "coder",
+            "tech_writer": "tech_writer"
         }
     )
-    
     workflow.add_edge("tech_writer", END)
     
     return workflow.compile()
