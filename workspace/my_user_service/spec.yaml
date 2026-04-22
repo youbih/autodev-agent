@@ -1,0 +1,8 @@
+project_name: my_user_service
+description: 基于 FastAPI 的后端服务
+framework: FastAPI
+architecture: layered (api -> service -> repo -> model)
+database: SQLite + SQLAlchemy
+endpoints:
+- /users (GET, POST)
+- /users/{id} (GET, PUT, DELETE)
